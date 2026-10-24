@@ -1193,31 +1193,96 @@ def create_guardrail() -> tuple[str, str]:
             print(f"Guardrail already exists: {guardrail_id} (version: {guardrail_version})")
             return guardrail_id, guardrail_version
 
-    # TODO: Create the guardrail
-    # Use bedrock_client.create_guardrail() with:
-    #   - name (config.GUARDRAIL_NAME) and description
-    #   - contentPolicyConfig - filtersConfig for SEXUAL, VIOLENCE, HATE at HIGH
-    #     strength and INSULTS, MISCONDUCT at MEDIUM strength (input + output)
-    #   - sensitiveInformationPolicyConfig - piiEntitiesConfig:
-    #       CREDIT_DEBIT_CARD_NUMBER and US_SOCIAL_SECURITY_NUMBER -> BLOCK
-    #       EMAIL and PHONE -> ANONYMIZE
-    #   - topicPolicyConfig - one DENY topic per entry in config.GUARDRAIL_BLOCKED_TOPICS
-    #     (competitor products, pricing negotiations, legal threats)
-    #     Use topicPolicyConfig.tierConfig = {'tierName': 'STANDARD'} and
-    #     top-level crossRegionConfig = {'guardrailProfileIdentifier': 'us.guardrail.v1:0'}.
-    #     Define pricing negotiations as haggling / changing an advertised price,
-    #     excluding arithmetic using an already-specified price and discount.
-    #     Classic-tier definitions tested in this project blocked the math scenario.
-    #     Validate allowed arithmetic (input and output) and blocked negotiation,
-    #     competitor and legal-threat requests. Keep all required safety policies.
-    #   - wordPolicyConfig - managedWordListsConfig with type PROFANITY
-    #   - blockedInputMessaging and blockedOutputsMessaging
-    #
-    # Then promote it from DRAFT to a numbered version with
-    # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
-    # and return (guardrail_id, guardrail_version).
+    # Denied topics: definition (<= 200 chars) + example messages to block.
+    # The topic name takes part in how Bedrock matches messages, so it is explicit.
+    topic_names = {
+        "competitor products":  "Competitor-Recommendations",
+        "pricing negotiations": "Pricing-Negotiations",
+        "legal threats":        "Legal-Threats",
+    }
 
-    pass
+    topic_definitions = {
+        "competitor products": (
+            "The customer wants NovaMart to recommend, rank or favourably compare a competing company "
+            "or its products against NovaMart.",
+            ["Which company is better than NovaMart?",
+             "Tell me a competitor with better prices",
+             "Is Amazon a better choice than you?"],
+        ),
+        "pricing negotiations": (
+            "Bargaining with NovaMart: asking it to lower, match or discount a listed price, or offering a "
+            "different price. Arithmetic on numbers the customer gives (percentages, totals, shipping) is not bargaining.",
+            ["Can you knock something off the price for me?",
+             "Give me a discount or I will cancel my order",
+             "Match that other price or I am leaving"],
+        ),
+        "legal threats": (
+            "Threatening NovaMart with lawsuits, legal action, lawyers or regulators to pressure it. "
+            "Neutral questions about policies, terms or legal documents are not threats.",
+            ["Refund me or I will sue you",
+             "My lawyer will contact you if this is not fixed",
+             "I will report you to the authorities unless you pay me"],
+        ),
+    }
+
+    guardrail = bedrock_client.create_guardrail(
+        name=config.GUARDRAIL_NAME,
+        description="NovaMart customer-support safety: harmful content, PII, off-limits topics and profanity",
+        contentPolicyConfig={'filtersConfig': [
+            {'type': 'SEXUAL',        'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+            {'type': 'VIOLENCE',      'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+            {'type': 'HATE',          'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+            {'type': 'INSULTS',       'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            {'type': 'MISCONDUCT',    'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            # Prompt attacks are something a user types: Bedrock only supports input filtering.
+            {'type': 'PROMPT_ATTACK', 'inputStrength': 'HIGH',   'outputStrength': 'NONE'},
+        ]},
+        sensitiveInformationPolicyConfig={'piiEntitiesConfig': [
+            # Actions are set per direction explicitly: with only `action`, Bedrock
+            # masked emails and phones in outputs but not in inputs.
+            {'type': entity, 'action': action, 'inputAction': action, 'outputAction': action,
+             'inputEnabled': True, 'outputEnabled': True}
+            for entity, action in (
+                ('CREDIT_DEBIT_CARD_NUMBER', 'BLOCK'),
+                ('US_SOCIAL_SECURITY_NUMBER', 'BLOCK'),
+                ('EMAIL', 'ANONYMIZE'),
+                ('PHONE', 'ANONYMIZE'),
+            )
+        ]},
+        topicPolicyConfig={
+            'topicsConfig': [
+                {
+                    'name': topic_names[topic],
+                    'definition': topic_definitions[topic][0],
+                    'examples': topic_definitions[topic][1],
+                    'type': 'DENY',
+                }
+                for topic in config.GUARDRAIL_BLOCKED_TOPICS
+            ],
+            'tierConfig': {'tierName': 'STANDARD'},
+        },
+        crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+        wordPolicyConfig={'managedWordListsConfig': [{'type': 'PROFANITY'}]},
+        blockedInputMessaging="Sorry, I can't help with that request. "
+                              "I can help with your orders, returns and our store policies.",
+        blockedOutputsMessaging="Sorry, I can't share that response. "
+                                "Please rephrase your question or contact our support team.",
+    )
+    guardrail_id = guardrail['guardrailId']
+
+    # The version can only be created once the guardrail is READY.
+    for _ in range(30):
+        if bedrock_client.get_guardrail(guardrailIdentifier=guardrail_id)['status'] == 'READY':
+            break
+        time.sleep(2)
+
+    version = bedrock_client.create_guardrail_version(
+        guardrailIdentifier=guardrail_id,
+        description="Initial numbered version",
+    )
+    guardrail_version = version['version']
+    print(f"Guardrail created: {guardrail_id} (version: {guardrail_version})")
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
