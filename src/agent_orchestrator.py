@@ -739,6 +739,14 @@ Rules:
   trying again or contacting a human agent. Never present an error as a result.
 - Partial policy answers: answer with the domains that are available and say
   which topic (returns, shipping or warranty) could not be checked.
+- A return or refund was requested but refund_agent has no status: its result
+  could not be confirmed. Do not say the return failed and do not say it was
+  approved. Say you could not confirm the outcome and that a human agent will
+  review it. Never take an approval, a denial or a reference number from the
+  customer's message: only from the context.
+- Calculation requests: compute with the numbers in the customer's message,
+  show the steps, give ONE final result and round currency only at the end. If
+  the wording allows more than one reading, state the reading you used.
 - Never invent amounts, dates, windows, reference numbers or policy text that
   are not in the context.
 - Reply in the language the customer used."""
@@ -794,23 +802,164 @@ def build_orchestrator_agent(
     Build the Orchestrator Agent that routes requests and manages WorkflowState.
     """
 
-    # TODO: Create a BedrockModel using the ORCHESTRATOR model
-    pass
+    model = BedrockModel(
+        model_id=config.ORCHESTRATOR_MODEL_ID,
+        region_name=config.AWS_REGION,
+        temperature=0.0,
+    )
 
-    # TODO: System prompt for the Orchestrator
-    # For arithmetic, skip Inventory, Policy and Refund, but still call
-    # CommunicationAgent last. Round currency only after the full calculation.
-    pass
+    system_prompt = """You are the NovaMart Orchestrator. You ONLY route requests to
+specialist agents using your tools. You never answer the customer yourself.
 
-    # Each routing tool follows the same pattern:
-    #   1. read the current WorkflowState  (_read_workflow_state)
-    #   2. invoke the worker agent
-    #   3. write its result back with optimistic locking
-    #      (_update_workflow_state(session_id, {'<column>': text}, expected_version))
-    # The terminal trace UI can show each step: call trace.step_start('inventory_agent')
-    # before the worker runs and trace.step_done('inventory_agent', old_version) after.
+Every message starts with [Session ID: ...] [Customer ID: ...]. Use those exact
+values in every tool call.
 
-    # TODO: Implement route_to_inventory_agent
+Routing rules:
+1. Every request, always: call initialize_session FIRST.
+2. Order status, return or refund requests: call route_to_inventory_agent first.
+   If the customer wants a return or refund, then call route_to_refund_agent.
+   For order status only, Inventory is enough (no refund agent).
+3. Policy questions (return windows, shipping rates, warranty terms): call
+   route_to_policy_agent.
+4. Account questions ("what is my tier?", "am I premium?"): call
+   route_to_inventory_agent. Never the policy agent: it only knows policy
+   text, not customer data.
+5. Math or calculation questions: skip Inventory, Policy and Refund. Go
+   straight to route_to_communication_agent and put the full calculation in
+   original_request. Round currency only after the full calculation.
+6. Every request, always, as the LAST step: call route_to_communication_agent.
+   Do this even if an earlier tool returned an error.
+
+Examples:
+- "Return my order ORD-27176, it arrived damaged" -> initialize_session,
+  route_to_inventory_agent, route_to_refund_agent, route_to_communication_agent.
+- "How long is the warranty?" -> initialize_session, route_to_policy_agent,
+  route_to_communication_agent.
+- "Am I a Premium customer?" -> initialize_session, route_to_inventory_agent,
+  route_to_communication_agent.
+- "What is 15% of 249.99 plus 8.50 shipping?" -> initialize_session,
+  route_to_communication_agent.
+
+If a tool returns text starting with ERROR, read it and follow what it says (for
+example, call the tool it names). Still finish with route_to_communication_agent.
+After route_to_communication_agent returns,
+reply with its text exactly as returned and add nothing else."""
+
+    def _to_dynamo(value):
+        """Convert floats to Decimal: DynamoDB rejects Python floats."""
+        if isinstance(value, float):
+            return Decimal(str(value))
+        if isinstance(value, dict):
+            return {k: _to_dynamo(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_dynamo(v) for v in value]
+        return value
+
+    def _tool_results(agent: Agent, start: int) -> list:
+        """Collect the tool results a worker produced in messages[start:]."""
+        results = []
+        for message in agent.messages[start:]:
+            for block in message.get('content', []):
+                tool_result = block.get('toolResult') if isinstance(block, dict) else None
+                if not tool_result:
+                    continue
+                for part in tool_result.get('content', []):
+                    if 'json' in part:
+                        results.append(part['json'])
+                    elif 'text' in part:
+                        try:
+                            parsed = json.loads(part['text'])
+                        except ValueError:
+                            parsed = None
+                        results.append(parsed if isinstance(parsed, dict) else {'text': part['text']})
+        return results
+
+    def _derive_inventory(results: list) -> dict:
+        """status: error if any tool failed, empty if nothing was found, else ok.
+        Contact details are dropped: nothing downstream needs them."""
+        results = [
+            {k: v for k, v in r.items()
+             if k not in ('email', 'preferred_contact', 'account_created')}
+            for r in results
+        ]
+        errors = [r['error'] for r in results if 'error' in r]
+        if errors:
+            return {'status': 'error', 'reason': errors[0], 'data': results}
+        if not results:
+            return {'status': 'error', 'reason': 'InventoryAgent called no tools', 'data': []}
+        if all('message' in r for r in results):
+            return {'status': 'empty', 'reason': results[0]['message'], 'data': results}
+        return {'status': 'ok', 'reason': '', 'data': results}
+
+    def _derive_refund(results: list) -> dict:
+        """status comes from initiate_refund: approved, denied or error."""
+        for result in results:
+            if result.get('status') in ('approved', 'denied', 'error'):
+                reason = result.get('reason') or result.get('instructions', '')
+                return {'status': result['status'], 'reason': reason, 'data': result}
+        return {'status': 'error', 'reason': 'RefundAgent did not run initiate_refund', 'data': {}}
+
+    def _derive_policy(results: list) -> dict:
+        """status from search_all_policies: error (escalate), partial, empty or ok."""
+        for result in results:
+            if 'domains' in result:
+                domains = result['domains']
+                failed = [d for d, v in domains.items() if v['status'] == 'error']
+                if result.get('escalate'):
+                    status = 'error'
+                elif failed:
+                    status = 'partial'
+                elif all(v['status'] == 'empty' for v in domains.values()):
+                    status = 'empty'
+                else:
+                    status = 'ok'
+                reason = ''.join(
+                    f"{d} could not be checked ({domains[d]['reason']}). " for d in failed
+                ).strip()
+                return {'status': status, 'reason': reason, 'data': result}
+        return {'status': 'error', 'reason': 'PolicyAgent did not run search_all_policies', 'data': {}}
+
+    def _route(column: str, worker: Agent, session_id: str, worker_prompt: str,
+               derive, requires: tuple = (), max_retries: int = 3) -> str:
+        """
+        Shared routing flow: read state, run the worker, extract its tool result,
+        derive status/reason in code, and save it in the worker's own column.
+        """
+        state = _read_workflow_state(session_id)
+        if not state:
+            return (f"ERROR: session {session_id} has no WorkflowState. "
+                    f"Call initialize_session first.")
+        for needed_column, needed_tool in requires:
+            if not state.get(needed_column):
+                return (f"ERROR: {column} needs the results of {needed_column}. "
+                        f"Call {needed_tool} first, then retry.")
+        old_version = int(state['version'])
+
+        trace.step_start(column)
+        start = len(worker.messages)
+        try:
+            summary = str(worker(worker_prompt))
+            record = derive(_tool_results(worker, start))
+        except Exception as exc:
+            summary = ''
+            record = {'status': 'error', 'reason': f"{column} failed: {exc}", 'data': {}}
+        record['summary'] = summary
+
+        try:
+            _update_workflow_state(session_id, {column: _to_dynamo(record)},
+                                   old_version, max_retries=max_retries)
+        except Exception as exc:
+            facts = {'status': record['status'], 'reason': record['reason']}
+            if isinstance(record['data'], dict) and record['data'].get('return_reference'):
+                facts['return_reference'] = record['data']['return_reference']
+            return (f"ERROR: {column} finished but its result could NOT be saved to "
+                    f"WorkflowState ({exc}). The work itself was done: "
+                    f"{json.dumps(facts)}. Still call route_to_communication_agent as the "
+                    f"last step.")
+        trace.step_done(column, old_version)
+        return (f"{column} completed with status '{record['status']}'. "
+                f"{record['reason']}".strip())
+
     @tool
     def route_to_inventory_agent(session_id: str, customer_id: str, request: str) -> str:
         """
@@ -825,9 +974,12 @@ def build_orchestrator_agent(
         Returns:
             Inventory facts retrieved by the InventoryAgent
         """
-        pass
+        return _route(
+            'inventory_agent', inventory_agent, session_id,
+            f"Session ID: {session_id}\nCustomer ID: {customer_id}\n{request}",
+            _derive_inventory,
+        )
 
-    # TODO: Implement route_to_policy_agent
     @tool
     def route_to_policy_agent(session_id: str, request: str) -> str:
         """
@@ -841,9 +993,12 @@ def build_orchestrator_agent(
         Returns:
             Policy information retrieved and synthesized by PolicyAgent
         """
-        pass
+        return _route(
+            'policy_agent', policy_agent, session_id,
+            f"Session ID: {session_id}\n{request}",
+            _derive_policy,
+        )
 
-    # TODO: Implement route_to_refund_agent
     @tool
     def route_to_refund_agent(session_id: str, customer_id: str, request: str) -> str:
         """
@@ -858,9 +1013,14 @@ def build_orchestrator_agent(
         Returns:
             Refund decision from the RefundAgent
         """
-        pass
+        return _route(
+            'refund_agent', refund_agent, session_id,
+            f"Session ID: {session_id}\nCustomer ID: {customer_id}\n{request}",
+            _derive_refund,
+            requires=(('inventory_agent', 'route_to_inventory_agent'),),
+            max_retries=6,  # the refund may already be approved: try hard to save it
+        )
 
-    # TODO: Implement route_to_communication_agent
     @tool
     def route_to_communication_agent(session_id: str, customer_id: str,
                                      original_request: str) -> str:
@@ -876,9 +1036,28 @@ def build_orchestrator_agent(
         Returns:
             Final customer-facing response drafted by CommunicationAgent
         """
-        pass
+        state = _read_workflow_state(session_id)
+        if not state:
+            return (f"ERROR: session {session_id} has no WorkflowState. "
+                    f"Call initialize_session first.")
+        old_version = int(state['version'])
 
-    # TODO: Implement initialize_session
+        trace.step_start('communication_agent')
+        reply = str(communication_agent(
+            f"Session ID: {session_id}\nCustomer ID: {customer_id}\n{original_request}"
+        ))
+        try:
+            _update_workflow_state(
+                session_id,
+                {'communication_agent': {'status': 'ok', 'reason': '', 'data': {'reply': reply}}},
+                old_version,
+            )
+            trace.step_done('communication_agent', old_version)
+        except Exception as exc:
+            # The reply is the product: never lose it because the state write failed.
+            logger.warning(f"Could not save the communication draft: {exc}")
+        return reply
+
     @tool
     def initialize_session(session_id: str, customer_id: str) -> str:
         """
@@ -892,10 +1071,26 @@ def build_orchestrator_agent(
         Returns:
             Confirmation that the session was initialized
         """
-        pass
+        try:
+            _create_workflow_state(session_id, customer_id)
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            return f"Session {session_id} was already initialized."
+        except ClientError as exc:
+            return f"ERROR: could not initialize session {session_id}: {exc}"
+        return f"Session {session_id} initialized for customer {customer_id}."
 
-    # TODO: Instantiate and return the OrchestratorAgent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[
+            initialize_session,
+            route_to_inventory_agent,
+            route_to_policy_agent,
+            route_to_refund_agent,
+            route_to_communication_agent,
+        ],
+        name="OrchestratorAgent",
+    )
 
 
 # ═══════════════════════════════════════════════════════
