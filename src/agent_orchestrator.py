@@ -45,6 +45,8 @@ import uuid
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 # Ensure the parent directory is on sys.path so config.py and
@@ -224,16 +226,34 @@ def build_inventory_agent() -> Agent:
     only retrieves data for the OrchestratorAgent to share with downstream agents.
     """
 
-    # TODO: Create a BedrockModel using the WORKER model
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        region_name=config.AWS_REGION,
+        temperature=0.1,
+    )
 
-    # TODO: System prompt for the Inventory Agent
-    pass
+    system_prompt = """You are the NovaMart Inventory Agent. Your only job is to gather facts about
+orders and customers from the database using your tools.
 
-    # TODO: Implement check_order_status
-    # NOTE: the Orders table has a COMPOSITE key (customer_id = partition key,
-    # order_id = sort key), so a get_item needs BOTH values. That is why this
-    # tool takes customer_id as well as order_id.
+- Use check_order_status for one order, get_customer_tier for a customer's
+  tier, and list_customer_orders for all of a customer's orders.
+- Always report: order status, order date, product, price, and the customer's
+  tier, when available.
+- Report facts only. NEVER decide whether an order is eligible for a return
+  or refund, and never mention policies.
+- If a tool returns a not-found result, say so explicitly. NEVER invent or
+  guess a value."""
+
+    def _to_plain(value):
+        """Convert DynamoDB Decimal values to int/float so results are JSON-serializable."""
+        if isinstance(value, Decimal):
+            return int(value) if value == value.to_integral_value() else float(value)
+        if isinstance(value, dict):
+            return {k: _to_plain(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_plain(v) for v in value]
+        return value
+
     @tool
     def check_order_status(customer_id: str, order_id: str) -> dict:
         """
@@ -248,9 +268,18 @@ def build_inventory_agent() -> Agent:
             Order record (order_id, status, product_name, order_date, price, ...)
             or a not-found message
         """
-        pass
+        try:
+            table = dynamodb.Table(config.ORDERS_TABLE)
+            response = table.get_item(
+                Key={'customer_id': customer_id, 'order_id': order_id}
+            )
+        except ClientError as e:
+            return {'error': f"Could not read order {order_id}: {e}"}
+        item = response.get('Item')
+        if not item:
+            return {'message': f"Order {order_id} not found for customer {customer_id}."}
+        return _to_plain(item)
 
-    # TODO: Implement get_customer_tier
     @tool
     def get_customer_tier(customer_id: str) -> dict:
         """
@@ -263,9 +292,16 @@ def build_inventory_agent() -> Agent:
         Returns:
             Customer profile including tier and account details
         """
-        pass
+        try:
+            table = dynamodb.Table(config.CUSTOMERS_TABLE)
+            response = table.get_item(Key={'customer_id': customer_id})
+        except ClientError as e:
+            return {'error': f"Could not read customer {customer_id}: {e}"}
+        item = response.get('Item')
+        if not item:
+            return {'message': f"Customer {customer_id} not found."}
+        return _to_plain(item)
 
-    # TODO: Implement list_customer_orders
     @tool
     def list_customer_orders(customer_id: str) -> dict:
         """
@@ -277,10 +313,22 @@ def build_inventory_agent() -> Agent:
         Returns:
             List of all orders with order_id, status, order_date, and amount
         """
-        pass
+        try:
+            table = dynamodb.Table(config.ORDERS_TABLE)
+            response = table.query(KeyConditionExpression=Key('customer_id').eq(customer_id))
+        except ClientError as e:
+            return {'error': f"Could not list orders for {customer_id}: {e}"}
+        orders = response.get('Items', [])
+        if not orders:
+            return {'message': f"No orders found for customer {customer_id}."}
+        return {'customer_id': customer_id, 'orders': _to_plain(orders)}
 
-    # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[check_order_status, get_customer_tier, list_customer_orders],
+        name="InventoryAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -295,13 +343,28 @@ def build_refund_agent() -> Agent:
     WorkflowState and applies the correct policy window per customer tier.
     """
 
-    # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        region_name=config.AWS_REGION,
+        temperature=0.1,
+    )
 
-    # TODO: System prompt for the Refund Agent
-    pass
+    system_prompt = """You are the NovaMart Refund Agent. You handle return and refund requests.
 
-    # TODO: Implement get_inventory_context
+Process, in this order:
+1. Call get_inventory_context with the session_id to read the order facts
+   gathered by the Inventory Agent (order, order date, customer tier).
+2. Call initiate_refund with the customer_id, order_id and the customer's reason.
+   The tool checks eligibility itself against the database: Standard
+   customers have a 30-day return window, Premium customers 60 days.
+3. Report the tool's result exactly: approved or denied, the reason, and the
+   return reference if there is one.
+
+Never approve or deny a return on your own and never invent dates, windows or
+reference numbers. Only report what the tools return."""
+
+    return_windows = {'Standard': 30, 'Premium': 60}
+
     @tool
     def get_inventory_context(session_id: str) -> dict:
         """
@@ -313,13 +376,17 @@ def build_refund_agent() -> Agent:
         Returns:
             The inventory_agent field from WorkflowState, or empty dict if not yet set
         """
-        pass
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {}
+        return state.get('inventory_agent', {}) or {}
 
-    # TODO: Implement initiate_refund
     @tool
     def initiate_refund(customer_id: str, order_id: str, reason: str) -> dict:
         """
         Initiate a return by updating the order record in DynamoDB.
+        Eligibility is verified here from the database (order date and customer
+        tier), not from what the caller says: Standard = 30 days, Premium = 60.
 
         Args:
             customer_id: The customer's unique identifier
@@ -327,12 +394,79 @@ def build_refund_agent() -> Agent:
             reason: Customer-provided reason for the return
 
         Returns:
-            Confirmation dict with return_reference number and instructions
+            Dict with status 'approved' (plus return_reference and instructions)
+            or 'denied' (plus the reason it was denied)
         """
-        pass
+        try:
+            orders = dynamodb.Table(config.ORDERS_TABLE)
+            order = orders.get_item(
+                Key={'customer_id': customer_id, 'order_id': order_id}
+            ).get('Item')
+            customer = dynamodb.Table(config.CUSTOMERS_TABLE).get_item(
+                Key={'customer_id': customer_id}
+            ).get('Item')
 
-    # TODO: Instantiate and return the Agent
-    pass
+            if not order:
+                return {'status': 'denied', 'reason': f"Order {order_id} not found for customer {customer_id}."}
+            if not customer:
+                return {'status': 'denied', 'reason': f"Customer {customer_id} not found."}
+            if order.get('return_status'):
+                return {
+                    'status': 'denied',
+                    'reason': f"A return was already started for {order_id} "
+                              f"(reference {order.get('return_reference')}).",
+                }
+            if order.get('status') != 'delivered':
+                return {
+                    'status': 'denied',
+                    'reason': f"Order {order_id} has status '{order.get('status')}'; only delivered orders can be returned.",
+                }
+
+            tier = customer.get('tier', 'Standard')
+            window_days = return_windows.get(tier, return_windows['Standard'])
+            order_date = datetime.strptime(order['order_date'], '%Y-%m-%d').date()
+            days_elapsed = (datetime.now(timezone.utc).date() - order_date).days
+
+            if days_elapsed > window_days:
+                return {
+                    'status': 'denied',
+                    'reason': f"Order placed {days_elapsed} days ago; the {tier} return window is {window_days} days.",
+                    'days_elapsed': days_elapsed,
+                    'window_days': window_days,
+                    'tier': tier,
+                }
+
+            return_reference = f"RET-{uuid.uuid4().hex[:8].upper()}"
+            orders.update_item(
+                Key={'customer_id': customer_id, 'order_id': order_id},
+                UpdateExpression="SET return_status = :s, return_reference = :r, "
+                                 "return_reason = :why, return_date = :d",
+                ConditionExpression='attribute_not_exists(return_status)',
+                ExpressionAttributeValues={
+                    ':s': 'return_initiated',
+                    ':r': return_reference,
+                    ':why': reason,
+                    ':d': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                },
+            )
+            return {
+                'status': 'approved',
+                'return_reference': return_reference,
+                'days_elapsed': days_elapsed,
+                'window_days': window_days,
+                'tier': tier,
+                'instructions': "Pack the item with its original packaging and use the prepaid return label. "
+                                "The refund is issued once the item is received.",
+            }
+        except ClientError as e:
+            return {'status': 'error', 'reason': f"Could not process the return: {e}"}
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_inventory_context, initiate_refund],
+        name="RefundAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -449,13 +583,45 @@ def build_communication_agent() -> Agent:
     and composing a coherent, empathetic response.
     """
 
-    # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        region_name=config.AWS_REGION,
+        temperature=0.3,
+    )
 
-    # TODO: System prompt for the Communication Agent
-    pass
+    system_prompt = """You are the NovaMart Communication Agent. You write the final
+message the customer will read.
 
-    # TODO: Implement get_full_workflow_context
+Process:
+1. Call get_full_workflow_context with the session_id to read what the other
+   agents found: inventory_agent, policy_agent and refund_agent.
+2. Write one clear, empathetic reply based ONLY on the status and reason
+   recorded in those fields.
+
+Rules:
+- A field that is empty or has no status was not consulted: do not mention it.
+- status 'approved' or 'denied': say so, give the recorded reason, and include
+  the return reference if there is one. For a denial, be kind and state the
+  reason plainly (for example the days elapsed and the return window).
+- status 'error': apologize and say that part could not be completed. Never
+  include technical details (table names, exceptions, stack traces). Suggest
+  trying again or contacting a human agent. Never present an error as a result.
+- Partial policy answers: answer with the domains that are available and say
+  which topic (returns, shipping or warranty) could not be checked.
+- Never invent amounts, dates, windows, reference numbers or policy text that
+  are not in the context.
+- Reply in the language the customer used."""
+
+    def _to_plain(value):
+        """Convert DynamoDB Decimals so the tool result is JSON-serializable."""
+        if isinstance(value, Decimal):
+            return int(value) if value == value.to_integral_value() else float(value)
+        if isinstance(value, dict):
+            return {k: _to_plain(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_plain(v) for v in value]
+        return value
+
     @tool
     def get_full_workflow_context(session_id: str) -> dict:
         """
@@ -465,12 +631,22 @@ def build_communication_agent() -> Agent:
             session_id: The current session identifier
 
         Returns:
-            Full WorkflowState dict (inventory_agent, policy_agent, refund_agent)
+            Full WorkflowState dict (inventory_agent, policy_agent, refund_agent).
+            A field with no data comes back as an empty dict, meaning that
+            agent was not consulted.
         """
-        pass
+        state = _read_workflow_state(session_id) or {}
+        return {
+            field: _to_plain(state.get(field, {}) or {})
+            for field in ('inventory_agent', 'policy_agent', 'refund_agent')
+        }
 
-    # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_full_workflow_context],
+        name="CommunicationAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
